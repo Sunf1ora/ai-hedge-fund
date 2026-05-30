@@ -1,5 +1,4 @@
 import json
-import time
 from langchain_core.messages import HumanMessage
 from langchain_core.prompts import ChatPromptTemplate
 
@@ -16,6 +15,17 @@ class PortfolioDecision(BaseModel):
     confidence: int = Field(description="Confidence 0-100")
     reasoning: str = Field(description="Reasoning for the decision")
 
+    # Deterministic risk plan added after the LLM decision.
+    # These fields make the output more usable for paper-trading and prevent the
+    # model from only saying buy/sell without an exit discipline.
+    entry_price: float | None = Field(default=None, description="Reference entry price used for the plan")
+    stop_loss: float | None = Field(default=None, description="Invalidation price for the trade")
+    take_profit_1: float | None = Field(default=None, description="First partial take-profit price")
+    take_profit_2: float | None = Field(default=None, description="Second/extended take-profit price")
+    trailing_stop_pct: float | None = Field(default=None, description="Trailing stop percentage after take_profit_1 is reached")
+    max_holding_days: int | None = Field(default=None, description="Maximum holding window for the signal")
+    risk_notes: str | None = Field(default=None, description="Short deterministic risk note")
+
 
 class PortfolioManagerOutput(BaseModel):
     decisions: dict[str, PortfolioDecision] = Field(description="Dictionary of ticker to trading decisions")
@@ -23,7 +33,7 @@ class PortfolioManagerOutput(BaseModel):
 
 ##### Portfolio Management Agent #####
 def portfolio_management_agent(state: AgentState, agent_id: str = "portfolio_manager"):
-    """Makes final trading decisions and generates orders for multiple tickers"""
+    """Makes final trading decisions and generates risk-managed trade plans for multiple tickers."""
 
     portfolio = state["data"]["portfolio"]
     analyst_signals = state["data"]["analyst_signals"]
@@ -174,6 +184,205 @@ def _compact_signals(signals_by_ticker: dict[str, dict]) -> dict[str, dict]:
     return out
 
 
+def _normalize_confidence(confidence: float | int | None) -> float:
+    """Return confidence as a 0-100 float, accepting either 0-1 or 0-100 inputs."""
+    if confidence is None:
+        return 50.0
+    try:
+        value = float(confidence)
+    except (TypeError, ValueError):
+        return 50.0
+    if 0 <= value <= 1:
+        value *= 100
+    return max(0.0, min(value, 100.0))
+
+
+def compute_signal_score(ticker_signals: dict[str, dict]) -> dict[str, float | int | str]:
+    """Convert analyst votes into a deterministic score in [-1, 1].
+
+    This is intentionally simple and transparent. It is not meant to replace the
+    analysts; it is a guardrail that prevents a weak, noisy bullish vote from
+    becoming an oversized buy order.
+    """
+    signal_values = {"bullish": 1.0, "neutral": 0.0, "bearish": -1.0}
+    weighted_sum = 0.0
+    total_weight = 0.0
+    votes: list[float] = []
+
+    for payload in ticker_signals.values():
+        sig = payload.get("sig") or payload.get("signal")
+        if sig not in signal_values:
+            continue
+        conf = _normalize_confidence(payload.get("conf") if "conf" in payload else payload.get("confidence"))
+        weight = max(conf / 100.0, 0.05)
+        value = signal_values[sig]
+        weighted_sum += value * weight
+        total_weight += weight
+        votes.append(value)
+
+    if total_weight == 0:
+        return {"score": 0.0, "agreement": 0.0, "vote_count": 0, "direction": "neutral"}
+
+    score = weighted_sum / total_weight
+    direction = "bullish" if score > 0.2 else "bearish" if score < -0.2 else "neutral"
+    if direction == "neutral":
+        agreement = votes.count(0.0) / len(votes) if votes else 0.0
+    else:
+        target = 1.0 if direction == "bullish" else -1.0
+        agreement = sum(1 for vote in votes if vote == target) / len(votes)
+
+    return {
+        "score": float(score),
+        "agreement": float(agreement),
+        "vote_count": len(votes),
+        "direction": direction,
+    }
+
+
+def _build_exit_plan(action: str, price: float, signal_score: float, confidence: int) -> dict[str, float | int | str | None]:
+    """Create deterministic stop-loss, take-profit, trailing-stop, and holding-window fields."""
+    if price <= 0 or action not in {"buy", "short"}:
+        return {
+            "entry_price": price if price > 0 else None,
+            "stop_loss": None,
+            "take_profit_1": None,
+            "take_profit_2": None,
+            "trailing_stop_pct": None,
+            "max_holding_days": None,
+            "risk_notes": "No exit plan required for non-entry action",
+        }
+
+    strength = abs(signal_score)
+    # Weaker signals get tighter stops and shorter review windows.
+    if strength < 0.35 or confidence < 60:
+        stop_pct = 0.06
+        max_days = 5
+        note = "Weak edge: tight stop and fast review"
+    elif strength < 0.60 or confidence < 75:
+        stop_pct = 0.08
+        max_days = 10
+        note = "Moderate edge: standard swing-trade plan"
+    else:
+        stop_pct = 0.10
+        max_days = 20
+        note = "Strong edge: wider stop with trailing exit"
+
+    reward_1 = stop_pct * 1.8
+    reward_2 = stop_pct * 3.0
+    trailing_stop_pct = max(0.05, stop_pct * 0.75)
+
+    if action == "buy":
+        return {
+            "entry_price": round(price, 4),
+            "stop_loss": round(price * (1 - stop_pct), 4),
+            "take_profit_1": round(price * (1 + reward_1), 4),
+            "take_profit_2": round(price * (1 + reward_2), 4),
+            "trailing_stop_pct": round(trailing_stop_pct, 4),
+            "max_holding_days": max_days,
+            "risk_notes": note,
+        }
+
+    return {
+        "entry_price": round(price, 4),
+        "stop_loss": round(price * (1 + stop_pct), 4),
+        "take_profit_1": round(price * (1 - reward_1), 4),
+        "take_profit_2": round(price * (1 - reward_2), 4),
+        "trailing_stop_pct": round(trailing_stop_pct, 4),
+        "max_holding_days": max_days,
+        "risk_notes": note,
+    }
+
+
+def _post_process_decisions(
+    decisions: dict[str, PortfolioDecision],
+    tickers: list[str],
+    signals_by_ticker: dict[str, dict],
+    current_prices: dict[str, float],
+    allowed_actions_full: dict[str, dict[str, int]],
+) -> dict[str, PortfolioDecision]:
+    """Apply deterministic quality gates, quantity caps, and exit plans.
+
+    This layer is the main fix for the previous weakness: the LLM can propose a
+    trade, but weak/low-agreement signals are downgraded to hold, and every entry
+    receives a stop-loss/take-profit plan.
+    """
+    processed: dict[str, PortfolioDecision] = {}
+
+    for ticker in tickers:
+        decision = decisions.get(
+            ticker,
+            PortfolioDecision(action="hold", quantity=0, confidence=0, reasoning="Missing decision; default hold"),
+        )
+        allowed = allowed_actions_full.get(ticker, {"hold": 0})
+        score_info = compute_signal_score(signals_by_ticker.get(ticker, {}))
+        score = float(score_info["score"])
+        agreement = float(score_info["agreement"])
+        vote_count = int(score_info["vote_count"])
+        confidence = int(_normalize_confidence(decision.confidence))
+
+        # Enforce allowed action and max quantity.
+        if decision.action not in allowed:
+            decision = PortfolioDecision(action="hold", quantity=0, confidence=confidence, reasoning="Action not allowed; downgraded to hold")
+        elif decision.action != "hold":
+            decision.quantity = max(0, min(int(decision.quantity), int(allowed.get(decision.action, 0))))
+            if decision.quantity == 0:
+                decision.action = "hold"
+                decision.reasoning = "Quantity unavailable; hold"
+
+        # Quality gate: a directional entry needs signal strength and agreement.
+        if decision.action == "buy":
+            if score < 0.20 or agreement < 0.45 or confidence < 55 or vote_count < 2:
+                decision = PortfolioDecision(
+                    action="hold",
+                    quantity=0,
+                    confidence=min(confidence, 50),
+                    reasoning="Bullish edge too weak; hold",
+                )
+        elif decision.action == "short":
+            if score > -0.20 or agreement < 0.45 or confidence < 55 or vote_count < 2:
+                decision = PortfolioDecision(
+                    action="hold",
+                    quantity=0,
+                    confidence=min(confidence, 50),
+                    reasoning="Bearish edge too weak; hold",
+                )
+
+        # Size cap: weaker signals should not use the full risk limit.
+        if decision.action in {"buy", "short"}:
+            max_allowed = int(allowed.get(decision.action, 0))
+            strength = abs(score)
+            if strength < 0.35:
+                size_multiplier = 0.33
+            elif strength < 0.60:
+                size_multiplier = 0.60
+            else:
+                size_multiplier = 1.00
+            capped_qty = int(max_allowed * size_multiplier)
+            decision.quantity = max(0, min(decision.quantity, capped_qty))
+            if decision.quantity == 0:
+                decision.action = "hold"
+                decision.reasoning = "Signal too weak for minimum position; hold"
+
+        plan = _build_exit_plan(
+            action=decision.action,
+            price=float(current_prices.get(ticker, 0.0)),
+            signal_score=score,
+            confidence=confidence,
+        )
+        decision.entry_price = plan["entry_price"]
+        decision.stop_loss = plan["stop_loss"]
+        decision.take_profit_1 = plan["take_profit_1"]
+        decision.take_profit_2 = plan["take_profit_2"]
+        decision.trailing_stop_pct = plan["trailing_stop_pct"]
+        decision.max_holding_days = plan["max_holding_days"]
+        decision.risk_notes = plan["risk_notes"]
+        decision.confidence = confidence
+
+        processed[ticker] = decision
+
+    return processed
+
+
 def generate_trading_decision(
         tickers: list[str],
         signals_by_ticker: dict[str, dict],
@@ -183,7 +392,7 @@ def generate_trading_decision(
         agent_id: str,
         state: AgentState,
 ) -> PortfolioManagerOutput:
-    """Get decisions from the LLM with deterministic constraints and a minimal prompt."""
+    """Get decisions from the LLM, then enforce deterministic risk and exit rules."""
 
     # Deterministic constraints
     allowed_actions_full = compute_allowed_actions(tickers, current_prices, max_shares, portfolio)
@@ -196,13 +405,21 @@ def generate_trading_decision(
         # If only 'hold' key exists, there is no trade possible
         if set(aa.keys()) == {"hold"}:
             prefilled_decisions[t] = PortfolioDecision(
-                action="hold", quantity=0, confidence=100.0, reasoning="No valid trade available"
+                action="hold", quantity=0, confidence=100, reasoning="No valid trade available"
             )
         else:
             tickers_for_llm.append(t)
 
     if not tickers_for_llm:
-        return PortfolioManagerOutput(decisions=prefilled_decisions)
+        return PortfolioManagerOutput(
+            decisions=_post_process_decisions(
+                decisions=prefilled_decisions,
+                tickers=tickers,
+                signals_by_ticker=signals_by_ticker,
+                current_prices=current_prices,
+                allowed_actions_full=allowed_actions_full,
+            )
+        )
 
     # Build compact payloads only for tickers sent to LLM
     compact_signals = _compact_signals({t: signals_by_ticker.get(t, {}) for t in tickers_for_llm})
@@ -216,6 +433,7 @@ def generate_trading_decision(
                 "You are a portfolio manager.\n"
                 "Inputs per ticker: analyst signals and allowed actions with max qty (already validated).\n"
                 "Pick one allowed action per ticker and a quantity ≤ the max. "
+                "Prefer hold when signals are mixed or weak. "
                 "Keep reasoning very concise (max 100 chars). No cash or margin math. Return JSON only."
             ),
             (
@@ -244,7 +462,7 @@ def generate_trading_decision(
         decisions = dict(prefilled_decisions)
         for t in tickers_for_llm:
             decisions[t] = PortfolioDecision(
-                action="hold", quantity=0, confidence=0.0, reasoning="Default decision: hold"
+                action="hold", quantity=0, confidence=0, reasoning="Default decision: hold"
             )
         return PortfolioManagerOutput(decisions=decisions)
 
@@ -259,4 +477,13 @@ def generate_trading_decision(
     # Merge prefilled holds with LLM results
     merged = dict(prefilled_decisions)
     merged.update(llm_out.decisions)
-    return PortfolioManagerOutput(decisions=merged)
+
+    return PortfolioManagerOutput(
+        decisions=_post_process_decisions(
+            decisions=merged,
+            tickers=tickers,
+            signals_by_ticker=signals_by_ticker,
+            current_prices=current_prices,
+            allowed_actions_full=allowed_actions_full,
+        )
+    )
